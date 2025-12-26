@@ -1,4 +1,4 @@
-# InterviewSense AI — Backend (Python)
+# InterviewSense AI — Backend
 
 Minimal FastAPI backend skeleton for InterviewSense AI MVP.
 
