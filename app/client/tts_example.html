@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>InterviewSense AI — Browser TTS Example</title>
+</head>
+<body>
+  <h3>Browser SpeechSynthesis Example</h3>
+  <textarea id="text" rows="4" cols="60">Welcome to your mock interview. Let's begin.</textarea><br/>
+  <select id="persona">
+    <option value="friendly">Friendly</option>
+    <option value="neutral" selected>Neutral</option>
+    <option value="strict">Strict</option>
+  </select>
+  <button id="speak">Speak (Browser)</button>
+
+  <script>
+    function speakText(text, {rate=1.0, pitch=1.0, voiceName=null}={}){
+      if(!('speechSynthesis' in window)){
+        alert('Browser does not support SpeechSynthesis API');
+        return;
+      }
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.rate = rate;
+      utter.pitch = pitch;
+      if(voiceName){
+        const voices = speechSynthesis.getVoices();
+        const v = voices.find(x=>x.name===voiceName);
+        if(v) utter.voice = v;
+      }
+      speechSynthesis.cancel();
+      speechSynthesis.speak(utter);
+    }
+
+    document.getElementById('speak').addEventListener('click', ()=>{
+      const text = document.getElementById('text').value;
+      const persona = document.getElementById('persona').value;
+      const persona_map = {friendly:{rate:1.05,pitch:1.1}, neutral:{rate:1.0,pitch:1.0}, strict:{rate:0.95,pitch:0.9}};
+      speakText(text, persona_map[persona]);
+    });
+
+    // Example: using server-provided tts_instructions
+    async function speakFromServer(sessionId, text){
+      const resp = await fetch('/v1/tts/generate', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({session_id:sessionId, text, persona:'friendly'})});
+      const data = await resp.json();
+      if(data.use_client_tts){
+        const instr = data.tts_instructions;
+        speakText(instr.text, instr.voice_parameters);
+      } else if(data.audio_url){
+        // Fallback — download audio blob and play via <audio>
+        const audio = new Audio(data.audio_url);
+        audio.play();
+      }
+    }
+  </script>
+</body>
+</html>

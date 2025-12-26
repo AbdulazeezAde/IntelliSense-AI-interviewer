@@ -1,0 +1,262 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>InterviewSense — Siri-like Demo</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Arial; margin: 24px; }
+    .panel { max-width: 720px; margin: 0 auto; }
+    .controls { display:flex; gap:8px; margin-bottom:12px; }
+    button { padding:8px 12px; border-radius:6px; border:1px solid #ccc; background:#f7f7f7; cursor:pointer }
+    button.primary { background:#0366d6; color:#fff; border: none }
+    .conversation { display:flex; flex-direction:column; gap:10px; max-height:320px; overflow:auto; padding:12px; border-radius:8px; border:1px solid #eee; background:#fafafa }
+    .msg { padding:10px 14px; border-radius:18px; max-width:75%; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+    .msg.user { align-self:flex-end; background:#0366d6; color:#fff; border-bottom-right-radius:4px }
+    .msg.assistant { align-self:flex-start; background:#f1f3f4; color:#111 }
+    .msg.partial { opacity:0.85; font-style:italic }
+    .msg .meta { font-size:11px; color:rgba(0,0,0,0.5); margin-top:6px }
+    .status { margin-bottom:8px; display:flex; gap:12px; align-items:center }
+    label { display:inline-flex; gap:6px; align-items:center }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h2>InterviewSense — Siri-like demo</h2>
+    <p>Record your voice, stream it to the backend STT, get partials & final feedback, and listen to TTS responses.</p>
+
+    <div class="controls">
+      <input id="sessionId" placeholder="session id" value="demo-session" />
+      <button id="startSession">Start Session</button>
+      <label><input type="checkbox" id="clientTts" /> Client TTS</label>
+      <label><input type="checkbox" id="emotionOptIn" /> Emotion Opt-in</label>
+    </div>
+
+    <div class="controls">
+      <button id="startRec" class="primary">Start Recording</button>
+      <button id="stopRec">Stop Recording / Finalize</button>
+      <button id="simTrans">Send Simulated Transcript</button>
+    </div>
+
+    <div class="status">WebSocket: <span id="wsStatus">disconnected</span></div>
+
+    <h4>Live partial transcript</h4>
+    <div id="partial" style="font-size:1.1em; padding:8px 0; min-height:36px"></div>
+
+    <h4>Conversation</h4>
+    <div id="conversation" class="conversation" aria-live="polite"></div>
+    <div style="margin-top:8px; font-size:13px; color:#666">Recording: <span id="recStatus">idle</span></div>
+
+  </div>
+
+<script>
+const apiBase = location.origin + '/v1';
+let ws = null;
+let mediaRecorder = null;
+let socketOpen = false;
+let sessionIdInput = document.getElementById('sessionId');
+let startBtn = document.getElementById('startRec');
+let stopBtn = document.getElementById('stopRec');
+let simBtn = document.getElementById('simTrans');
+let startSessionBtn = document.getElementById('startSession');
+let wsStatus = document.getElementById('wsStatus');
+let partialEl = document.getElementById('partial');
+const convEl = document.getElementById('conversation');
+const recStatusEl = document.getElementById('recStatus');
+let clientTtsCheckbox = document.getElementById('clientTts');
+let emotionOptInCheckbox = document.getElementById('emotionOptIn');
+
+let partialBubble = null;
+
+function scrollConvToBottom() {
+  convEl.scrollTop = convEl.scrollHeight;
+}
+
+function addMessage(role, text) {
+  if (!text) return;
+  // remove existing partial if user utterance is added
+  if (partialBubble && role === 'user') {
+    clearPartial();
+  }
+  const el = document.createElement('div');
+  el.className = 'msg ' + (role === 'user' ? 'user' : 'assistant');
+  el.innerHTML = String(text).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  convEl.appendChild(el);
+  scrollConvToBottom();
+}
+
+function setPartial(text) {
+  if (!partialBubble) {
+    partialBubble = document.createElement('div');
+    partialBubble.className = 'msg user partial';
+    convEl.appendChild(partialBubble);
+  }
+  partialBubble.innerHTML = String(text).replace(/</g, '&lt;').replace(/>/g, '&gt;') + ' <span style="opacity:0.7">…</span>';
+  scrollConvToBottom();
+}
+
+function clearPartial() {
+  if (partialBubble && partialBubble.parentNode) {
+    partialBubble.parentNode.removeChild(partialBubble);
+  }
+  partialBubble = null;
+}
+
+// silent logger (no visible debug logs per UX preference)
+function log() { /* noop */ }
+
+async function startSession() {
+  const sid = sessionIdInput.value;
+  const payload = { session_id: sid, user_id: 'web_user', interview_type: 'behavioral', persona: 'neutral', emotion_opt_in: !!emotionOptInCheckbox.checked, client_tts: !!clientTtsCheckbox.checked };
+  const res = await fetch(apiBase + '/sessions/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  if (!res.ok) { alert('failed to start session'); return }
+  const data = await res.json();
+  // Show the interviewer's opening question in the conversation
+  addMessage('assistant', data.question_text);
+}
+
+function connectWs() {
+  const sid = sessionIdInput.value;
+  if (!sid) { alert('set session id'); return }
+  if (ws) ws.close();
+  const url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/v1/ws/audio/' + encodeURIComponent(sid);
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { socketOpen = true; wsStatus.textContent = 'connected'; };
+  ws.onclose = () => { socketOpen = false; wsStatus.textContent = 'disconnected'; };
+  ws.onerror = (e) => { console.error('ws error', e); };
+  ws.onmessage = (evt) => {
+    try {
+      const obj = JSON.parse(evt.data);
+      handleServerMessage(obj);
+    } catch(e) {
+      console.warn('non-json ws message');
+    }
+  }
+}
+
+function handleServerMessage(msg) {
+  if (msg.type === 'stt_partial') {
+    // show partial as a temporary user bubble
+    setPartial(msg.partial || '...');
+  } else if (msg.type === 'turn_result') {
+    const r = msg.result;
+    clearPartial();
+    // Add user's transcript as a user bubble and assistant feedback as assistant bubble
+    addMessage('user', r.stt.transcript || '(no transcript)');
+    const assistantText = r.llm.short_feedback_snippet || r.llm.follow_up_question || 'Thanks for your answer.';
+    addMessage('assistant', assistantText);
+    // Play TTS for short_feedback_snippet if present
+    const ttsText = r.llm.short_feedback_snippet || r.llm.follow_up_question || '';
+    if (ttsText) {
+      requestAndPlayTTS(ttsText);
+    }
+    // Show emotion events if present
+    if (r.emotion_events && r.emotion_events.length) {
+      addMessage('assistant', 'Emotion events: ' + JSON.stringify(r.emotion_events));
+    }
+  } else if (msg.type === 'error') {
+    addMessage('assistant', 'Error: ' + JSON.stringify(msg));
+  }
+}
+
+async function requestAndPlayTTS(text) {
+  const sid = sessionIdInput.value;
+  if (!sid || !text) return;
+  const payload = { session_id: sid, text: text, persona: 'neutral', audio_format: 'wav' };
+  try {
+    const res = await fetch(apiBase + '/tts/generate', { method:'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    if (!res.ok) { console.error('TTS generate failed'); return }
+    const data = await res.json();
+    if (data.use_client_tts) {
+      // Client TTS instructions: use speechSynthesis
+      const instr = data.tts_instructions || { text };
+      const utter = new SpeechSynthesisUtterance(instr.text);
+      // simple mapping to pitch/rate
+      if (instr.voice_parameters) {
+        utter.rate = instr.voice_parameters.rate || 1.0;
+        utter.pitch = instr.voice_parameters.pitch || 1.0;
+      }
+      window.speechSynthesis.speak(utter);
+    } else if (data.audio_url) {
+      const a = new Audio(data.audio_url);
+      a.play().catch(e => console.error('audio play fail', e));
+    }
+  } catch (e) {
+    console.error('TTS request error', e);
+  }
+}
+
+function arrayBufferToBase64(buffer) {
+  // convert an ArrayBuffer to base64 (works for chunks)
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const sub = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+    binary += String.fromCharCode.apply(null, sub);
+  }
+  return btoa(binary);
+}
+
+async function startRecording() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { alert('getUserMedia not supported'); return }
+
+  // Ensure ws connected
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    connectWs();
+    // wait a moment to open
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+  mediaRecorder.ondataavailable = (ev) => {
+    if (!ev.data || ev.data.size === 0) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const arrayBuffer = reader.result;
+      const b64 = arrayBufferToBase64(arrayBuffer);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'audio_chunk', data: b64 }));
+      }
+    };
+    reader.readAsArrayBuffer(ev.data);
+  };
+  mediaRecorder.start(250); // small timeslice to stream frequently
+  recStatusEl.textContent = 'recording';
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'finalize' }));
+  }
+  recStatusEl.textContent = 'idle';
+}
+
+function sendSimulatedTranscript() {
+  const transcript = prompt('Enter simulated transcript to send to backend (sim_transcript):', 'I was nervous but I fixed it');
+  if (!transcript) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) { connectWs(); }
+  ws.send(JSON.stringify({ type: 'sim_transcript', transcript: transcript }));
+}
+
+// UI wiring
+startSessionBtn.onclick = startSession;
+startBtn.onclick = startRecording;
+stopBtn.onclick = stopRecording;
+simBtn.onclick = sendSimulatedTranscript;
+
+// Preserve toggles to preferences when starting session (silent UX)
+
+// Connect ws on page load so user hears partials live
+window.addEventListener('load', () => {
+  // Optionally auto-connect
+  // connectWs();
+});
+
+</script>
+</body>
+</html>
